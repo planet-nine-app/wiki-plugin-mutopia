@@ -94,6 +94,101 @@ async function loadMutopiaCredentials() {
 }
 
 /**
+ * Convert JSON feed to Canimus RSS XML
+ * Spec: https://github.com/PlaidWeb/Canimus
+ */
+function convertToCanimusRSS(jsonFeed) {
+  const feedTitle = jsonFeed.title || jsonFeed.name || 'Music Feed';
+  const feedUrl = jsonFeed.url || jsonFeed.home_page_url || '';
+  const feedDescription = jsonFeed.description || '';
+  const items = jsonFeed.items || [];
+
+  // Build RSS XML
+  let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
+  xml += '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/">\n';
+  xml += '  <channel>\n';
+  xml += `    <title>${escapeXml(feedTitle)}</title>\n`;
+  xml += `    <link>${escapeXml(feedUrl)}</link>\n`;
+  xml += `    <description>${escapeXml(feedDescription)}</description>\n`;
+
+  // Add iTunes metadata if available
+  if (jsonFeed.author) {
+    xml += `    <itunes:author>${escapeXml(jsonFeed.author.name || jsonFeed.author)}</itunes:author>\n`;
+  }
+
+  if (jsonFeed.image) {
+    xml += '    <image>\n';
+    xml += `      <url>${escapeXml(jsonFeed.image)}</url>\n`;
+    xml += `      <title>${escapeXml(feedTitle)}</title>\n`;
+    xml += `      <link>${escapeXml(feedUrl)}</link>\n`;
+    xml += '    </image>\n';
+    xml += `    <itunes:image href="${escapeXml(jsonFeed.image)}" />\n`;
+  }
+
+  // Add items (tracks)
+  items.forEach((item, index) => {
+    xml += '    <item>\n';
+    xml += `      <title>${escapeXml(item.title || item.name || `Track ${index + 1}`)}</title>\n`;
+
+    if (item.url) {
+      xml += `      <link>${escapeXml(item.url)}</link>\n`;
+    }
+
+    if (item.id) {
+      xml += `      <guid isPermaLink="false">${escapeXml(item.id)}</guid>\n`;
+    }
+
+    if (item.summary || item.description) {
+      xml += `      <description>${escapeXml(item.summary || item.description)}</description>\n`;
+    }
+
+    // Add enclosure for audio file
+    if (item.attachments && item.attachments.length > 0) {
+      const audio = item.attachments[0];
+      const url = audio.url || '';
+      const size = audio.size_in_bytes || 0;
+      const type = audio.mime_type || 'audio/mpeg';
+      xml += `      <enclosure url="${escapeXml(url)}" length="${size}" type="${type}" />\n`;
+    } else if (item.content_url) {
+      xml += `      <enclosure url="${escapeXml(item.content_url)}" length="0" type="audio/mpeg" />\n`;
+    }
+
+    // iTunes-specific fields
+    if (item.duration) {
+      xml += `      <itunes:duration>${escapeXml(item.duration)}</itunes:duration>\n`;
+    }
+
+    if (item.order !== undefined) {
+      xml += `      <itunes:order>${item.order}</itunes:order>\n`;
+    }
+
+    if (item.date_published) {
+      xml += `      <pubDate>${new Date(item.date_published).toUTCString()}</pubDate>\n`;
+    }
+
+    xml += '    </item>\n';
+  });
+
+  xml += '  </channel>\n';
+  xml += '</rss>';
+
+  return xml;
+}
+
+/**
+ * Escape XML special characters
+ */
+function escapeXml(str) {
+  if (typeof str !== 'string') return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
  * Parse Canimus RSS feed
  * Spec: https://github.com/PlaidWeb/Canimus
  */
@@ -369,6 +464,57 @@ async function startServer(params) {
   });
 
   /**
+   * Get feed in RSS or JSON format
+   * GET /plugin/mutopia/feed?format=rss|json
+   * Or use Accept header: application/rss+xml or application/json
+   */
+  app.get('/plugin/mutopia/feed', async function(req, res) {
+    try {
+      if (!mutopiaUser) {
+        return res.status(404).json({
+          success: false,
+          error: 'No music library available'
+        });
+      }
+
+      // Fetch JSON feed from Sanora
+      const feedResponse = await fetch(`http://localhost:${SANORA_PORT}/feeds/music/${mutopiaUser.uuid}`);
+      const jsonFeed = await feedResponse.json();
+
+      if (jsonFeed.error) {
+        throw new Error(jsonFeed.error);
+      }
+
+      // Determine format (query param takes precedence over Accept header)
+      const formatParam = req.query.format?.toLowerCase();
+      const acceptHeader = req.get('Accept') || '';
+
+      const wantsRss = formatParam === 'rss' ||
+                       formatParam === 'xml' ||
+                       acceptHeader.includes('application/rss+xml') ||
+                       acceptHeader.includes('application/xml') ||
+                       acceptHeader.includes('text/xml');
+
+      if (wantsRss) {
+        // Convert JSON to Canimus RSS
+        const rssXml = convertToCanimusRSS(jsonFeed);
+        res.set('Content-Type', 'application/rss+xml; charset=utf-8');
+        res.send(rssXml);
+      } else {
+        // Return JSON (default)
+        res.set('Content-Type', 'application/json');
+        res.json(jsonFeed);
+      }
+    } catch (err) {
+      console.error('[mutopia] Feed error:', err);
+      res.status(500).json({
+        success: false,
+        error: err.message
+      });
+    }
+  });
+
+  /**
    * Get library (list all albums/tracks)
    * GET /plugin/mutopia/library
    */
@@ -448,10 +594,30 @@ async function startServer(params) {
     });
   });
 
+  /**
+   * Serve bauble WASM file
+   * GET /plugin/mutopia/bauble.wasm
+   */
+  app.get('/plugin/mutopia/bauble.wasm', function(req, res) {
+    const wasmPath = path.join(__dirname, '../bauble/target/wasm32-unknown-unknown/release/mutopia_bauble.wasm');
+
+    if (fs.existsSync(wasmPath)) {
+      res.setHeader('Content-Type', 'application/wasm');
+      res.sendFile(wasmPath);
+    } else {
+      res.status(404).json({
+        error: 'Bauble not built',
+        hint: 'Run: cd bauble && cargo build --target wasm32-unknown-unknown --release'
+      });
+    }
+  });
+
   console.log('✅ wiki-plugin-mutopia ready!');
   console.log('📍 Routes:');
   console.log('   POST /plugin/mutopia/upload - Upload Canimus archive');
+  console.log('   GET /plugin/mutopia/feed?format=rss|json - Get feed (RSS or JSON)');
   console.log('   GET /plugin/mutopia/library - Get music library');
+  console.log('   GET /plugin/mutopia/bauble.wasm - Bauble WASM');
   console.log('   /plugin/mutopia/sanora/* -> http://localhost:' + SANORA_PORT + '/*');
   console.log('   /plugin/mutopia/dolores/* -> http://localhost:' + DOLORES_PORT + '/*');
 }
